@@ -1,0 +1,11 @@
+[Unit]
+Description=Avisos de ocupacion SSD y externo
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/homelab/space-mail.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cloud-space check
+UMask=0077
+TimeoutStartSec=120

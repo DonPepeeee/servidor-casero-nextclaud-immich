@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Inicializa carpetas y secreto interno, no arranca ni reinstala aplicaciones.
+set -euo pipefail
+[[ $EUID -eq 0 ]] || { printf 'Ejecutar con sudo.\n' >&2; exit 1; }
+/usr/local/sbin/cloud-storage-check
+PROYECTO='/opt/homelab/immich'
+ESTADO='/srv/appdata/immich'
+[[ ! -e "$PROYECTO/.env" ]] || { printf '.env ya existe; no regenerar credenciales.\n' >&2; exit 1; }
+[[ ! -e "$ESTADO/postgres/PG_VERSION" ]] || { printf 'PostgreSQL ya tiene datos; detener y revisar.\n' >&2; exit 1; }
+[[ ! -e '/srv/storage/immich/media/upload/.immich' ]] || { printf 'Immich ya tiene datos; detener y revisar.\n' >&2; exit 1; }
+command -v openssl >/dev/null
+umask 077
+
+# Mantener cwd en el externo durante la preparacion: no permitir desmontaje normal.
+cd /srv/storage
+/usr/local/sbin/cloud-storage-check
+install -d -m 0755 immich/media
+install -d -m 0700 recovery/immich recovery/immich/database
+install -d -m 0755 "$PROYECTO" "$ESTADO" "$ESTADO/thumbs" "$ESTADO/model-cache" "$ESTADO/redis"
+install -d -m 0700 "$ESTADO/postgres"
+
+set -o noclobber
+cat > "$PROYECTO/.env" <<EOF
+DB_PASSWORD=$(openssl rand -hex 32)
+IMMICH_TRUSTED_PROXIES=127.0.0.1
+EOF
+chmod 0600 "$PROYECTO/.env"
+printf 'Preparacion completa. .env protegido en %s; no se muestran secretos.\n' "$PROYECTO"
+printf 'La contrasena del administrador se elegira en la web; esta es solo la de PostgreSQL.\n'

@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Variante solo SSD: verifica el filesystem raiz; no monta ni escribe.
+set -euo pipefail
+
+PUNTO='/srv/storage'
+source /etc/homelab/storage.conf
+UUID_ESPERADO="$STORAGE_UUID"
+
+fallar() {
+  printf 'Disco no disponible: %s\n' "$1" >&2
+  exit 1
+}
+
+[[ -d "$PUNTO" ]] || fallar "no existe $PUNTO"
+[[ ! -L "$PUNTO" ]] || fallar 'la ruta de montaje es un enlace simbólico'
+if ! uuid_actual=$(findmnt -rn -T "$PUNTO" -o UUID); then
+  fallar "$PUNTO no pertenece a un filesystem accesible"
+fi
+[[ "$uuid_actual" == "$UUID_ESPERADO" ]] || fallar 'UUID distinto del esperado'
+[[ -b "/dev/disk/by-uuid/$UUID_ESPERADO" ]] || fallar 'el dispositivo ya no está presente'
+[[ "$(findmnt -rn -T "$PUNTO" -o FSTYPE)" == ext4 ]] || fallar 'el montaje no es ext4'
+opciones=$(findmnt -rn -T "$PUNTO" -o OPTIONS)
+case ",$opciones," in
+  *,rw,*) ;;
+  *) fallar 'el montaje no permite escritura' ;;
+esac
+
+printf 'SSD correcto: %s | UUID=%s | ext4 | rw\n' "$PUNTO" "$UUID_ESPERADO"

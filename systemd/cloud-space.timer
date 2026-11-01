@@ -1,0 +1,10 @@
+[Unit]
+Description=Comprobar almacenamiento cada 15 minutos
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+Unit=cloud-space.service
+
+[Install]
+WantedBy=timers.target

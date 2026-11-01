@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Preparacion inicial. No reinstala ni regenera credenciales existentes.
+set -euo pipefail
+[[ $EUID -eq 0 ]] || { printf 'Ejecutar con sudo.\n' >&2; exit 1; }
+/usr/local/sbin/cloud-storage-check
+PROYECTO='/opt/homelab/nextcloud'
+ESTADO='/srv/appdata/nextcloud'
+[[ ! -e "$PROYECTO/.env" ]] || { printf '.env ya existe; no se regeneran secretos.\n' >&2; exit 1; }
+[[ ! -e "$ESTADO/html/config/config.php" ]] || { printf 'Nextcloud ya tiene configuracion; detener y revisar.\n' >&2; exit 1; }
+[[ ! -e "$ESTADO/postgres/PG_VERSION" ]] || { printf 'PostgreSQL ya tiene datos; detener y revisar.\n' >&2; exit 1; }
+command -v openssl >/dev/null
+
+umask 077
+install -d -m 0755 "$PROYECTO" "$ESTADO/html"
+install -d -m 0700 "$ESTADO/postgres"
+# La cwd fija el montaje durante la creacion; no usar rutas externas sin comprobarlo.
+cd /srv/storage/nextcloud
+/usr/local/sbin/cloud-storage-check
+install -d -o 33 -g 33 -m 0750 data
+
+# noclobber evita sobreescribir el .env incluso ante una segunda ejecucion.
+set -o noclobber
+cat > "$PROYECTO/.env" <<EOF
+POSTGRES_PASSWORD=$(openssl rand -hex 32)
+NEXTCLOUD_ADMIN_USER=admin
+NEXTCLOUD_ADMIN_PASSWORD=$(openssl rand -hex 32)
+EOF
+chmod 0600 "$PROYECTO/.env"
+printf 'Preparacion completa. Credenciales en %s/.env (root, 0600); no se muestran.\n' "$PROYECTO"

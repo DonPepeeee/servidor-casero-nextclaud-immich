@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""Monitor de ocupacion SSD/USB con entrega SMTP y estado persistente."""
+import argparse
+from email.message import EmailMessage
+import fcntl
+import getpass
+import json
+import os
+from pathlib import Path
+import smtplib
+import ssl
+import subprocess
+import sys
+import time
+
+CONFIG = Path('/etc/homelab/space-mail.json')
+STATE = Path('/var/lib/cloud-space/state.json')
+
+
+def level(percent):
+    return max([0] + [n for n in (75, 85, 90) if percent >= n])
+
+
+def transition(old, percent):
+    new = level(percent)
+    return old if new < old and percent >= old - 3 else new
+
+
+def send(config, body, subject='Nube casera: almacenamiento'):
+    message = EmailMessage()
+    message['From'], message['To'] = config['sender'], config['recipient']
+    message['Subject'] = subject
+    message.set_content(body)
+    client = smtplib.SMTP_SSL if config['tls'] == 'ssl' else smtplib.SMTP
+    kwargs = dict(host=config['host'], port=config['port'], timeout=30)
+    if config['tls'] == 'ssl':
+        kwargs['context'] = ssl.create_default_context()
+    with client(**kwargs) as smtp:
+        if config['tls'] == 'starttls':
+            smtp.ehlo()
+            smtp.starttls(context=ssl.create_default_context())
+            smtp.ehlo()
+        smtp.login(config['user'], config['password'])
+        if smtp.send_message(message):
+            raise RuntimeError('El servidor SMTP rechazo algun destinatario.')
+
+
+def configure():
+    if CONFIG.exists():
+        raise RuntimeError('Ya existe configuracion. Usar sudoedit para modificarla.')
+    config = {}
+    config['host'] = input('Servidor SMTP de tu proveedor: ').strip()
+    config['tls'] = input('TLS (ssl para 465 / starttls para 587): ').strip()
+    if config['tls'] not in ('ssl', 'starttls'):
+        raise RuntimeError('Elegir ssl o starttls.')
+    config['port'] = int(input('Puerto SMTP: '))
+    config['user'] = input('Usuario SMTP: ').strip()
+    config['sender'] = input('Correo remitente autorizado: ').strip()
+    config['recipient'] = input('Correo que recibira los avisos: ').strip()
+    config['password'] = getpass.getpass('Contrasena SMTP/de aplicacion (oculta): ')
+    if not all(config.values()):
+        raise RuntimeError('Faltan datos; no se guarda configuracion.')
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    with CONFIG.open('x') as stream:
+        json.dump(config, stream)
+    os.chmod(CONFIG, 0o600)
+    print('Configuracion guardada. Ejecuta test-mail y comprueba la recepcion.')
+
+
+def measurement(path):
+    stat = os.statvfs(path)
+    used = stat.f_blocks - stat.f_bfree
+    return 100 * used / (used + stat.f_bavail), stat.f_bavail * stat.f_frsize
+
+
+def check(config, state_path=STATE):
+    state_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    state = json.loads(state_path.read_text()) if state_path.exists() else {}
+    readings = {'SSD': measurement('/')}
+    guard = subprocess.run(['/usr/local/sbin/cloud-storage-check'], capture_output=True)
+    if guard.returncode == 0:
+        readings['USB'] = measurement('/srv/storage')
+    else:
+        print('USB ausente/no valido: no se mide la carpeta del SSD como externo.')
+    now = time.time()
+    for name, (percent, free) in readings.items():
+        previous = state.get(name, {'level': 0, 'sent': 0})
+        current = transition(previous['level'], percent)
+        if current != previous['level'] or (current and now - previous['sent'] >= 86400):
+            send(config, f'{name}: {percent:.1f}% usado; {free / 1024**3:.1f} GiB disponibles.\n'
+                 f'Nivel {previous["level"]} -> {current}. UTC: '
+                 f'{time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())}.\n'
+                 'Revisa importaciones y espacio disponible. No se ha borrado ningun archivo.')
+            state[name] = {'level': current, 'sent': now}
+            temporary = state_path.with_suffix('.tmp')
+            temporary.write_text(json.dumps(state))
+            temporary.replace(state_path)
+        print(f'{name}: {percent:.1f}%, nivel {current}, libres {free / 1024**3:.1f} GiB')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=['configure', 'test-mail', 'check', 'simulate', 'notify'])
+    parser.add_argument('--percent', type=float)
+    parser.add_argument('--message')
+    args = parser.parse_args()
+    if os.geteuid() != 0:
+        raise RuntimeError('Ejecutar con sudo.')
+    os.umask(0o077)
+    if args.action == 'configure':
+        configure()
+        return
+    config = json.loads(CONFIG.read_text())
+    if args.action == 'test-mail':
+        send(config, 'PRUEBA de entrega. Confirma recepcion antes de activar el timer.')
+        print('SMTP acepto el mensaje. Comprueba la bandeja y spam.')
+    elif args.action == 'notify':
+        if not args.message:
+            raise RuntimeError('Falta --message.')
+        send(config, args.message, 'Nube casera: bateria y apagado')
+    elif args.action == 'simulate':
+        if args.percent is None or not 0 <= args.percent <= 100:
+            raise RuntimeError('Usar --percent entre 0 y 100.')
+        send(config, f'SIMULACION: {args.percent}% -> nivel {level(args.percent)}. No se han llenado discos.')
+        print('Simulacion enviada; el estado real no se modifica.')
+    else:
+        with open('/run/cloud-space.lock', 'a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            check(config)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as exc:
+        print('ERROR del monitor: ' + str(exc), file=sys.stderr)
+        sys.exit(1)

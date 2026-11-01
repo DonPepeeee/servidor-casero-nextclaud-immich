@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""Monitor de bateria interna de portatil; no compatible con SAI USB/NUT."""
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+SUPPLIES = Path('/sys/class/power_supply')
+CONFIG = Path('/etc/homelab/battery.json')
+STATE = Path('/run/cloud-battery-state.json')
+
+
+def reading():
+    batteries, adapters = [], []
+    for path in SUPPLIES.iterdir():
+        kind = (path / 'type').read_text().strip()
+        if kind == 'Battery':
+            batteries.append(path)
+        elif kind == 'Mains':
+            adapters.append(int((path / 'online').read_text().strip()))
+    if len(batteries) != 1 or not adapters or any(n not in (0, 1) for n in adapters):
+        raise RuntimeError('Se requiere una bateria y adaptador Mains con online valido.')
+    battery = batteries[0]
+    percent = int((battery / 'capacity').read_text().strip())
+    status = (battery / 'status').read_text().strip()
+    if not 0 <= percent <= 100:
+        raise RuntimeError('Porcentaje de bateria invalido.')
+    return percent, not any(adapters), status
+
+
+def notify(message):
+    print(message, flush=True)
+    try:
+        subprocess.run(['/usr/local/sbin/cloud-space', 'notify', '--message', message],
+                       check=True, timeout=8)
+        return True
+    except (OSError, subprocess.SubprocessError) as exc:
+        print('Correo no confirmado: ' + str(exc), file=sys.stderr, flush=True)
+        return False
+
+
+def decision(percent, on_battery, threshold):
+    return on_battery and percent <= threshold
+
+
+def check(config, state_path=STATE):
+    threshold = config['shutdown_percent']
+    if type(threshold) is not int or not 20 <= threshold <= 95:
+        raise RuntimeError('shutdown_percent debe ser entero entre 20 y 95, previamente medido.')
+    if config.get('external_power_confirmed') is not True:
+        raise RuntimeError('Falta confirmar que el externo sigue alimentado durante el corte.')
+    percent, on_battery, status = reading()
+    print(f'Bateria {percent}%, sin corriente={on_battery}, estado={status}', flush=True)
+    # La actuacion local nunca depende de SMTP ni de que exista red.
+    if decision(percent, on_battery, threshold):
+        notify(f'Bateria baja ({percent}% <= {threshold}%): iniciando recovery frio y apagado. '
+               'El inicio NO confirma copia completa; revisar journal al volver.')
+        subprocess.run(['systemctl', 'start', '--no-block', 'cloud-battery-shutdown.service'], check=True)
+        return
+    previous = json.loads(state_path.read_text()) if state_path.exists() else None
+    if previous != on_battery:
+        message = ('CORTE: funcionando con bateria' if on_battery else 'Alimentacion de red presente')
+        if notify(f'{message}. Carga {percent}%. Umbral de apagado {threshold}%.'):
+            temporary = state_path.with_suffix('.tmp')
+            temporary.write_text(json.dumps(on_battery))
+            temporary.replace(state_path)
+
+
+def finish():
+    result = os.environ.get('SERVICE_RESULT', 'desconocido')
+    try:
+        notify(f'Job recovery terminado: SERVICE_RESULT={result}. '
+               'Solo success indica salida correcta del job. Apagando ordenadamente; '
+               'verificar PUNTO COMPLETO y checksums tras volver a encender.')
+    finally:
+        subprocess.run(['systemctl', '--no-block', 'poweroff'], check=True, timeout=15)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=['status', 'check', 'simulate', 'finish'])
+    parser.add_argument('--percent', type=int)
+    args = parser.parse_args()
+    if args.action == 'status':
+        print(reading())
+        return
+    if args.action == 'simulate':
+        if args.percent is None or not 0 <= args.percent <= 100:
+            raise RuntimeError('Usar --percent entre 0 y 100.')
+        cfg = json.loads(CONFIG.read_text())
+        for battery in (False, True):
+            print(f'SIMULACION {args.percent}%, sin corriente={battery}: '
+                  f'apagar={decision(args.percent, battery, cfg["shutdown_percent"])}')
+        print('Sin correo, copia ni apagado real.')
+        return
+    if os.geteuid() != 0:
+        raise RuntimeError('Ejecutar con sudo.')
+    os.umask(0o077)
+    if args.action == 'finish':
+        finish()
+    else:
+        check(json.loads(CONFIG.read_text()))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as exc:
+        print('ERROR bateria: ' + str(exc), file=sys.stderr)
+        sys.exit(1)

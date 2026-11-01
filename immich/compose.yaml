@@ -1,0 +1,113 @@
+# Base: Compose oficial de Immich v3.3.3; rutas y supervision adaptadas a esta guia.
+# Supervisor: cloud@immich.service. No usar restart always/unless-stopped.
+x-runtime: &runtime
+  restart: "no"
+  stop_grace_period: 90s
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  immich-server:
+    <<: *runtime
+    image: ghcr.io/immich-app/immich-server:v3.3.3
+    cpus: "2.0"
+    environment:
+      DB_HOSTNAME: database
+      DB_PORT: "5432"
+      DB_USERNAME: postgres
+      DB_DATABASE_NAME: immich
+      DB_PASSWORD: ${DB_PASSWORD:?Falta DB_PASSWORD en .env}
+      REDIS_HOSTNAME: redis
+      TZ: Europe/Madrid
+      CPU_CORES: "2"
+      IMMICH_TRUSTED_PROXIES: ${IMMICH_TRUSTED_PROXIES:-127.0.0.1}
+    ports:
+      - "127.0.0.1:2283:2283"
+    volumes:
+      - type: bind
+        source: /srv/storage/immich/media
+        target: /data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /srv/appdata/immich/thumbs
+        target: /data/thumbs
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /srv/storage/recovery/immich/database
+        target: /data/backups
+        bind:
+          create_host_path: false
+    depends_on:
+      database:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      disable: false
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
+  immich-machine-learning:
+    <<: *runtime
+    image: ghcr.io/immich-app/immich-machine-learning:v3.3.3
+    cpus: "2.0"
+    environment:
+      TZ: Europe/Madrid
+      MACHINE_LEARNING_WORKERS: "1"
+      MACHINE_LEARNING_REQUEST_THREADS: "1"
+      MACHINE_LEARNING_MODEL_TTL: "300"
+    volumes:
+      - type: bind
+        source: /srv/appdata/immich/model-cache
+        target: /cache
+        bind:
+          create_host_path: false
+    healthcheck:
+      disable: false
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
+  redis:
+    <<: *runtime
+    image: docker.io/valkey/valkey:9@sha256:c123e3715db63d06d4ad6964884037aa0d5d4d703939b9929954112889708e1d
+    command: ["valkey-server", "--appendonly", "yes"]
+    volumes:
+      - type: bind
+        source: /srv/appdata/immich/redis
+        target: /data
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  database:
+    <<: *runtime
+    image: ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0@sha256:bcf63357191b76a916ae5eb93464d65c07511da41e3bf7a8416db519b40b1c23
+    environment:
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Falta DB_PASSWORD en .env}
+      POSTGRES_USER: postgres
+      POSTGRES_DB: immich
+      POSTGRES_INITDB_ARGS: --data-checksums
+      DB_STORAGE_TYPE: SSD
+      TZ: Europe/Madrid
+    volumes:
+      - type: bind
+        source: /srv/appdata/immich/postgres
+        target: /var/lib/postgresql/data
+        bind:
+          create_host_path: false
+    shm_size: 128mb
+    healthcheck:
+      disable: false

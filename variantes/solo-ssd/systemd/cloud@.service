@@ -1,0 +1,26 @@
+[Unit]
+Description=Nube casera - proyecto Compose %i
+Requires=docker.service
+After=docker.service
+RequiresMountsFor=/srv/storage
+PartOf=cloud.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/homelab/%i
+Environment=COMPOSE_MENU=false
+ExecStartPre=/usr/local/sbin/cloud-storage-check
+ExecStartPre=/usr/bin/test ! -e /run/cloud-maintenance
+ExecStartPre=/usr/bin/docker compose --project-name cloud-%i --file compose.yaml config --quiet
+ExecStart=/usr/bin/docker compose --project-name cloud-%i --file compose.yaml up --abort-on-container-failure --remove-orphans --no-color --timeout 90
+ExecStop=/usr/bin/docker compose --project-name cloud-%i --file compose.yaml stop --timeout 90
+ExecStopPost=-/usr/bin/docker compose --project-name cloud-%i --file compose.yaml stop --timeout 90
+Restart=on-failure
+RestartSec=15
+TimeoutStartSec=900
+TimeoutStopSec=120
+
+[Install]
+WantedBy=cloud.target

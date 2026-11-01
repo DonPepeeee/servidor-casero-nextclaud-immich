@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Solo comprueba el montaje; no monta, escribe ni arranca servicios.
+set -euo pipefail
+
+PUNTO='/srv/storage'
+source /etc/homelab/storage.conf
+UUID_ESPERADO="$STORAGE_UUID"
+
+fallar() {
+  printf 'Disco no disponible: %s\n' "$1" >&2
+  exit 1
+}
+
+[[ ! -L "$PUNTO" ]] || fallar 'la ruta de montaje es un enlace simbólico'
+if ! uuid_actual=$(findmnt -rn -M "$PUNTO" -o UUID); then
+  fallar "$PUNTO no es un punto de montaje activo"
+fi
+[[ "$uuid_actual" == "$UUID_ESPERADO" ]] || fallar 'UUID distinto del esperado'
+[[ -b "/dev/disk/by-uuid/$UUID_ESPERADO" ]] || fallar 'el dispositivo ya no está presente'
+[[ "$(findmnt -rn -M "$PUNTO" -o FSTYPE)" == ext4 ]] || fallar 'el montaje no es ext4'
+opciones=$(findmnt -rn -M "$PUNTO" -o OPTIONS)
+case ",$opciones," in
+  *,rw,*) ;;
+  *) fallar 'el montaje no permite escritura' ;;
+esac
+
+printf 'Disco correcto: %s | UUID=%s | ext4 | rw\n' "$PUNTO" "$UUID_ESPERADO"

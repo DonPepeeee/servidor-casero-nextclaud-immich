@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+secrets/
+*.sql
+*.dump
+*.tar
+*.tar.gz
+__pycache__/
+space-mail.json
+battery.json
+storage.conf
+recovery/
+state-points/
+*.key
+*.pem
+.tmp*/

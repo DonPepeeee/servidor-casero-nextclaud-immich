@@ -1,0 +1,13 @@
+[Unit]
+Description=Punto frio de emergencia y apagado (tambien si falla la copia)
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStartPre=/usr/local/sbin/cloud-storage-check
+ExecStart=/usr/local/sbin/cloud-recovery backup
+ExecStopPost=/usr/local/sbin/cloud-battery finish
+TimeoutStartSec=10min
+TimeoutStopSec=30s
+KillMode=control-group
+UMask=0077

@@ -1,0 +1,7 @@
+* text=auto
+scripts/* text eol=lf
+systemd/* text eol=lf
+*.yaml text eol=lf
+*.py text eol=lf
+variantes/solo-ssd/scripts/* text eol=lf
+variantes/solo-ssd/systemd/* text eol=lf

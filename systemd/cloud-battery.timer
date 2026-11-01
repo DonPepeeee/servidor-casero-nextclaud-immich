@@ -1,0 +1,11 @@
+[Unit]
+Description=Comprobar bateria cada 30 segundos
+
+[Timer]
+OnBootSec=60s
+OnUnitInactiveSec=30s
+AccuracySec=1s
+Unit=cloud-battery.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,527 @@
+#!/usr/bin/env python3
+"""Punto frio de estado SSD; reutiliza originales del externo. Linux, como root.
+
+No programa copias, no copia originales, no exporta imagenes y no inicia servicios.
+La restauracion prepara un ensayo, no sustituye automaticamente el estado original.
+"""
+import argparse
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+STORAGE = Path('/srv/storage')
+STATE = Path('/srv/appdata')
+PROJECTS = Path('/opt/homelab')
+FROZEN_DIR = None
+CONTROL = Path('/etc/homelab')
+SYSTEMD = Path('/etc/systemd/system')
+MARKER = CONTROL / 'recovery-maintenance'
+FORMAT = 'cloud-cold-state-v2'
+APPS = ('nextcloud', 'immich')
+
+
+def need(condition, message):
+    if not condition:
+        raise RuntimeError(message)
+
+
+def run(args, **kwargs):
+    return subprocess.run([str(a) for a in args], check=True, **kwargs)
+
+
+def output(args):
+    return run(args, capture_output=True, text=True).stdout.strip()
+
+
+def compose(app, prefix, *args):
+    return ['docker', 'compose', '--project-name', f'{prefix}-{app}',
+            '--project-directory', PROJECTS / app,
+            '--file', (FROZEN_DIR / f'{app}.compose.json' if FROZEN_DIR
+                       else PROJECTS / app / 'compose.yaml'), *args]
+
+
+def storage_uuid():
+    need(not STORAGE.is_symlink(), 'El destino no puede ser un enlace.')
+    value = output(['findmnt', '-rn', '-M', STORAGE, '-o', 'UUID'])
+    need(bool(value), 'El externo no esta montado.')
+    need(output(['findmnt', '-rn', '-M', STORAGE, '-o', 'FSTYPE']) == 'ext4',
+         'Este ensayo requiere externo ext4.')
+    need('rw' in output(['findmnt', '-rn', '-M', STORAGE, '-o', 'OPTIONS']).split(','),
+         'El externo no permite escritura.')
+    return value
+
+
+def sha(path):
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def check_archives(point):
+    # No seguir listados de rutas arbitrarias procedentes del paquete.
+    sums = json.loads((point / 'checksums.json').read_text())
+    expected = {'state.tar.gz', 'projects.tar.gz', 'manifest.json',
+                'nextcloud.compose.json', 'immich.compose.json'}
+    need(set(sums) == expected, 'Inventario de checksums inesperado.')
+    for name in sorted(expected):
+        need(not (point / name).is_symlink(), 'Paquete con enlaces inesperados.')
+        need(sha(point / name) == sums[name], f'Checksum incorrecto: {name}')
+
+
+def checked_tar_members(archive, allowed):
+    with tarfile.open(archive, 'r:gz') as stream:
+        for item in stream:
+            path = Path(item.name)
+            need(not path.is_absolute() and '..' not in path.parts,
+                 'Ruta insegura en archivo.')
+            need(any(item.name == p or item.name.startswith(p + '/') for p in allowed),
+                 f'Contenido fuera de inventario: {item.name}')
+            need(not item.isdev() and not item.isfifo(), 'Tipo de archivo no permitido.')
+            # Se admiten enlaces propios de Nextcloud, pero no se desreferencian.
+            if item.islnk():
+                link = Path(item.linkname)
+                need(not link.is_absolute() and '..' not in link.parts,
+                     'Enlace duro fuera del archivo.')
+
+
+def assert_stopped(prefix, check_systemd=True):
+    for candidate in ('mb', 'cloud', 'cloud-restore'):
+        for app in APPS:
+            need(not output(['docker', 'ps', '-q', '--filter',
+                             f'label=com.docker.compose.project={candidate}-{app}']),
+                 f'Sigue activo {candidate}-{app}; no restaurar dos escritores.')
+    if check_systemd:
+        base, units = unit_names(prefix)
+        for unit in units:
+            probe = subprocess.run(['systemctl', 'show', unit, '--property=LoadState', '--value'],
+                                   capture_output=True, text=True)
+            if probe.stdout.strip() == 'not-found':
+                continue
+            need(probe.returncode == 0, 'No se pudo consultar systemd.')
+            need(output(['systemctl', 'show', unit, '--property=ActiveState', '--value'])
+                 in ('inactive', 'failed'), 'El supervisor de origen no esta parado.')
+
+
+def unit_names(prefix):
+    base = {'mb': 'mb-cloud', 'cloud': 'cloud', 'cloud-restore': 'cloud-restore'}[prefix]
+    return base, [f'{base}@{app}.service' for app in APPS]
+
+
+def backup(prefix, restored=None):
+    global STATE, PROJECTS, FROZEN_DIR
+    uuid = storage_uuid()
+    portable = bool(restored and (restored / 'PORTABLE').is_file())
+    if restored:
+        restored = restored.resolve(strict=True)
+        need(restored.parent == Path('/srv') and restored.name.startswith('cloud-restore.'),
+             'Ruta de restauracion inesperada.')
+        previous = Path((restored / 'SOURCE_POINT').read_text().strip())
+        need(MARKER.is_file() and MARKER.read_text().strip() == str(previous),
+             'El bloqueo no corresponde al ensayo de origen.')
+        STATE, PROJECTS, FROZEN_DIR = restored / 'appdata', restored / 'projects', restored
+    else:
+        need(not MARKER.exists(), 'Hay mantenimiento previo; revisar antes de copiar.')
+    for app in APPS:
+        need((PROJECTS / app / '.env').is_file(), f'Falta .env de {app}.')
+        run(compose(app, prefix, 'config', '--quiet'))
+    for candidate in ('mb', 'cloud', 'cloud-restore'):
+        if candidate != prefix:
+            for app in APPS:
+                need(not output(['docker', 'ps', '-q', '--filter',
+                                 f'label=com.docker.compose.project={candidate}-{app}']),
+                     'Hay otro proyecto usando las rutas de la nube.')
+    # Guardar solo los directorios SSD necesarios. No incluir modelos/miniaturas.
+    paths = ['nextcloud/html', 'nextcloud/postgres', 'immich/postgres', 'immich/redis']
+    for name in paths:
+        need((STATE / name).is_dir() and not (STATE / name).is_symlink(),
+             f'Falta directorio SSD regular: {name}')
+    marker = STATE / 'immich/thumbs/.immich'
+    if marker.is_file():
+        paths.append('immich/thumbs/.immich')
+    size = sum(int(output(['du', '-sb', STATE / name]).split()[0]) for name in paths)
+    need(shutil.disk_usage(STORAGE).free > size + 2 * 1024**3,
+         'Falta espacio para estado SSD mas 2 GiB de margen.')
+    base, units = unit_names(prefix)
+    points = STORAGE / 'recovery/state-points'
+    points.mkdir(mode=0o700, parents=True, exist_ok=True)
+    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    point = Path(tempfile.mkdtemp(prefix=timestamp + '.', suffix='.partial', dir=points))
+    # Guardia persistente: un reinicio no debe volver a aceptar escrituras por sorpresa.
+    MARKER.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    guard = Path('/etc/systemd/system') / f'{base}@.service.d/50-recovery.conf'
+    if not portable:
+        guard.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    freeze = Path('/etc/homelab/recovery-freeze-restored') if restored else MARKER
+    need(not restored or not freeze.exists(), 'El ensayo ya esta congelado; revisar.')
+    guard_text = '[Service]\nExecStartPre=/usr/bin/test ! -e ' + str(freeze) + '\n'
+    need(portable or not guard.exists() or guard.read_text() == guard_text,
+         '50-recovery.conf tiene otro contenido; no sobreescribir.')
+    MARKER.write_text(str(point) + '\n')
+    if restored:
+        freeze.write_text(str(point) + '\n')
+    if not portable:
+        guard.write_text(guard_text)
+        os.chmod(guard, 0o644)
+        run(['systemctl', 'daemon-reload'])
+    print('Parando ambos proyectos; permaneceran detenidos al terminar.', flush=True)
+    if portable:
+        for app in APPS:
+            run(compose(app, prefix, 'stop', '--timeout', '90'))
+    else:
+        run(['systemctl', 'stop', *([] if restored else [f'{base}.target']), *units])
+    assert_stopped(prefix, check_systemd=not portable)
+    images = {}
+    for app, db in [('nextcloud', 'db'), ('immich', 'database')]:
+        cfg = json.loads(output(compose(app, prefix, 'config', '--format', 'json')))
+        ids = output(['docker', 'ps', '-aq', '--filter',
+                      f'label=com.docker.compose.project={prefix}-{app}']).split()
+        need(bool(ids), f'No hay contenedores de {app}.')
+        containers = json.loads(output(['docker', 'inspect', *ids]))
+        services = {c['Config']['Labels']['com.docker.compose.service']: c for c in containers}
+        need(set(services) == set(cfg['services']), 'Servicios inesperados/ausentes.')
+        for service, spec in cfg['services'].items():
+            container = services[service]
+            need(container['State']['Status'] == 'exited', 'Contenedor no detenido.')
+            need(not container['State']['OOMKilled'], 'Hubo OOM; revisar antes de copiar.')
+            if service == db:
+                need(container['State']['ExitCode'] == 0, 'PostgreSQL no cerro limpiamente.')
+            for mount in container['Mounts']:
+                need(mount['Type'] in ('bind', 'tmpfs'), 'Volumen no inventariado.')
+                if mount['Type'] == 'bind':
+                    source = mount['Source']
+                    expected = {v['source'] for v in spec.get('volumes', []) if v['type'] == 'bind'}
+                    if portable:
+                        expected_targets = {v['target'] for v in spec.get('volumes', []) if v['type'] == 'bind'}
+                        need(mount['Destination'] in expected_targets, 'Destino de montaje inesperado.')
+                        need(source in expected or source.startswith(('/run/desktop/', '/mnt/wsl/')),
+                             'Alias de montaje Docker Desktop no reconocido.')
+                    else:
+                        need(source in expected, 'Montaje real diferente del Compose.')
+                        need(source.startswith((str(STATE) + '/', '/srv/storage/')),
+                             'Montaje fuera del inventario.')
+            image = json.loads(output(['docker', 'image', 'inspect', container['Image']]))[0]
+            need(bool(image.get('RepoDigests')), 'Imagen sin digest recuperable del registro.')
+            reference = image['RepoDigests'][0]
+            # Identidad portable: el Id local cambia entre almacenes Docker.
+            # RepoDigest identifica el contenido inmutable del registro.
+            images[reference] = reference.split('@', 1)[1]
+            spec['image'] = reference
+            if restored:
+                for volume in spec.get('volumes', []):
+                    if volume['type'] == 'bind' and volume['source'].startswith(str(STATE) + '/'):
+                        volume['source'] = '/srv/appdata/' + volume['source'][len(str(STATE)) + 1:]
+            if portable:
+                # El punto sigue siendo autonomo y restaura la red del servidor,
+                # no obliga a conservar los puertos HTTP locales de este ensayo.
+                original_spec = json.loads((previous / f'{app}.compose.json').read_text())['services'][service]
+                if 'ports' in original_spec:
+                    spec['ports'] = original_spec['ports']
+                for key in ('OVERWRITECLIURL', 'OVERWRITEPROTOCOL'):
+                    if key in original_spec.get('environment', {}):
+                        spec.setdefault('environment', {})[key] = original_spec['environment'][key]
+        # Estos JSON contienen secretos: nunca se imprimen ni se suben al repositorio.
+        (point / f'{app}.compose.json').write_text(json.dumps(cfg, indent=2) + '\n')
+    for app in APPS:
+        pg = STATE / app / 'postgres'
+        need(not (pg / 'postmaster.pid').exists(), 'PostgreSQL conserva postmaster.pid.')
+        need(not (pg / 'pg_wal').is_symlink(), 'WAL externo no soportado.')
+        need(not any((pg / 'pg_tblspc').iterdir()), 'Tablespaces externos no soportados.')
+    # El archivo no sigue symlinks; no contiene /srv/storage ni los originales.
+    for archive, cwd, names in [
+        ('state.tar.gz', STATE, paths),
+        ('projects.tar.gz', PROJECTS, list(APPS)),
+    ]:
+        run(['tar', '--acls', '--xattrs', '--numeric-owner', '--one-file-system',
+             '-czpf', point / archive, '-C', cwd, *names])
+    manifest = dict(format=FORMAT, prefix=prefix, utc=timestamp,
+                    architecture=platform.machine(), storage_uuid=uuid,
+                    state_paths=paths, images=images,
+                    originals_copied=False, physical_postgres=True, source_portable=portable)
+    (point / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+    sums = {name: sha(point / name) for name in (
+        'state.tar.gz', 'projects.tar.gz', 'manifest.json',
+        'nextcloud.compose.json', 'immich.compose.json')}
+    (point / 'checksums.json').write_text(json.dumps(sums, indent=2) + '\n')
+    check_archives(point)
+    checked_tar_members(point / 'state.tar.gz', paths)
+    checked_tar_members(point / 'projects.tar.gz', APPS)
+    (point / 'COMPLETE').write_text(FORMAT + '\n')
+    os.sync()
+    final = point.with_name(point.name.removesuffix('.partial'))
+    point.rename(final)
+    MARKER.write_text(str(final) + '\n')
+    os.sync()
+    print(f'PUNTO COMPLETO: {final}')
+    print('Sin copia de originales ni imagenes. Nube PARADA; mantenimiento persistente ACTIVO.')
+
+
+def verify(point):
+    point = point.resolve(strict=True)
+    need((point / 'COMPLETE').read_text().strip() == FORMAT, 'Punto incompleto/formato diferente.')
+    check_archives(point)
+    manifest = json.loads((point / 'manifest.json').read_text())
+    need(manifest['format'] == FORMAT and manifest['originals_copied'] is False,
+         'Formato no admitido.')
+    allowed = ['nextcloud/html', 'nextcloud/postgres', 'immich/postgres',
+               'immich/redis', 'immich/thumbs/.immich']
+    need(set(manifest['state_paths']).issubset(allowed), 'Inventario SSD inesperado.')
+    checked_tar_members(point / 'state.tar.gz', manifest['state_paths'])
+    checked_tar_members(point / 'projects.tar.gz', APPS)
+    print('Checksums e inventario de archivos: OK.')
+    return point, manifest
+
+
+def resume_source():
+    need(MARKER.is_file(), 'No hay copia detenida para reanudar.')
+    need(not Path('/etc/homelab/recovery-restore-started').exists(),
+         'Se ha iniciado una restauracion; no reactivar las bases anteriores.')
+    point, manifest = verify(Path(MARKER.read_text().strip()))
+    need(manifest['prefix'] in ('cloud', 'mb'), 'El punto no corresponde al origen normal.')
+    need(storage_uuid() == manifest['storage_uuid'], 'Disco diferente del punto.')
+    need(not Path('/etc/homelab/recovery-freeze-restored').exists(),
+         'Hay una restauracion congelada; revisar antes de reanudar.')
+    # Compatibilidad con restauraciones preparadas antes de incorporar el marcador.
+    for dest in Path('/srv').glob('cloud-restore.*'):
+        source = dest / 'SOURCE_POINT'
+        need(not source.is_file() or source.read_text().strip() != str(point),
+             'Este punto ya se utilizo para restaurar; no reanudar el origen.')
+    assert_stopped(manifest['prefix'])
+    base, units = unit_names(manifest['prefix'])
+    MARKER.unlink()
+    try:
+        run(['systemctl', 'reset-failed', *units, f'{base}.target'])
+        run(['systemctl', 'start', f'{base}.target', *units])
+    except Exception:
+        MARKER.write_text(str(point) + '\n')
+        run(['systemctl', 'stop', f'{base}.target', *units])
+        raise
+    print('Origen reanudado. Comprobar salud y acceso desde los clientes.')
+
+
+def prepare_next(point):
+    """Sustituye una restauracion detenida por un punto final trasladado."""
+    point, manifest = verify(point)
+    need(storage_uuid() == manifest['storage_uuid'], 'No es el externo de esta copia.')
+    need(manifest['architecture'] == platform.machine(), 'Arquitectura diferente.')
+    need(MARKER.is_file(), 'No hay origen bloqueado; usar --new-host en un equipo vacio.')
+    need(not (CONTROL / 'recovery-next-started').exists(),
+         'Ya hay un retorno iniciado; revisar antes de repetir.')
+    for prefix in ('cloud', 'mb', 'cloud-restore'):
+        assert_stopped(prefix)
+    # Preservar controles anteriores sin borrar estado SSD ni originales.
+    history = Path(tempfile.mkdtemp(prefix='before-restore.', dir=CONTROL))
+    (CONTROL / 'recovery-next-started').write_text(str(history) + '\n')
+    shutil.copy2(MARKER, history / MARKER.name)
+    dropin = SYSTEMD / 'cloud-restore@.service.d/40-transfer.conf'
+    dropin.parent.mkdir(parents=True, exist_ok=True)
+    text = '[Service]\nExecStartPre=/usr/bin/test ! -e /etc/homelab/recovery-next-started\n'
+    need(not dropin.exists() or dropin.read_text() == text, 'La guardia de traslado tiene otro contenido.')
+    dropin.write_text(text)
+    run(['systemctl', 'daemon-reload'])
+    target = subprocess.run(['systemctl', 'show', 'cloud-restored.target', '-p', 'LoadState', '--value'],
+                            capture_output=True, text=True)
+    if target.stdout.strip() not in ('', 'not-found'):
+        run(['systemctl', 'stop', 'cloud-restored.target'])
+    assert_stopped('cloud-restore')
+    for path in (SYSTEMD / 'cloud-restore@.service',
+                 CONTROL / 'recovery-freeze-restored'):
+        if path.exists():
+            path.rename(history / path.name)
+    MARKER.write_text(str(point) + '\n')
+    run(['systemctl', 'daemon-reload'])
+    prepare(point)
+    (CONTROL / 'recovery-next-started').unlink()
+    print('Controles anteriores conservados en ' + str(history))
+
+
+def prepare(point, portable=False, new_host=False):
+    point, manifest = verify(point)
+    need(manifest['architecture'] == platform.machine(), 'Arquitectura diferente.')
+    need(storage_uuid() == manifest['storage_uuid'], 'No es el externo del punto guardado.')
+    if new_host:
+        need(not portable, 'No combinar --new-host y --portable.')
+        need(not MARKER.exists(), 'Ya existe mantenimiento; revisar antes de preparar.')
+        for app in APPS:
+            need(not (PROJECTS / app / '.env').exists(), 'Hay una instalacion de origen.')
+            state = STATE / app
+            need(not state.exists() or not any(state.iterdir()), 'Hay estado SSD previo.')
+    if (portable or new_host) and not MARKER.exists():
+        MARKER.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        MARKER.write_text(str(point) + '\n')
+    need(MARKER.is_file() and MARKER.read_text().strip() == str(point),
+         'Falta el bloqueo de escrituras de este punto; no usar originales vivos con bases antiguas.')
+    assert_stopped(manifest['prefix'], check_systemd=not portable)
+    if not portable:
+        need(not Path('/etc/systemd/system/cloud-restore@.service').exists(),
+             'Ya existe un ensayo instalado; revisar antes de repetir.')
+    # Revisar rutas del archivo antes de extraer; usar solo paquetes propios.
+    needed = 2 * 1024**3
+    for name in ('state.tar.gz', 'projects.tar.gz'):
+        with tarfile.open(point / name) as stream:
+            needed += sum(item.size for item in stream)
+    need(shutil.disk_usage('/srv').free > needed, 'Falta margen libre en SSD.')
+    # Desde aqui una preparacion parcial tambien impide reactivar el origen.
+    Path('/etc/homelab/recovery-restore-started').write_text(str(point) + '\n')
+    dest = Path(tempfile.mkdtemp(prefix='cloud-restore.', dir='/srv'))
+    need(output(['findmnt', '-rn', '-T', dest, '-o', 'UUID']) != manifest['storage_uuid'],
+         'El destino de estado debe estar en SSD, no en el externo.')
+    for name, subdir in [('state.tar.gz', 'appdata'), ('projects.tar.gz', 'projects')]:
+        target = dest / subdir
+        target.mkdir(mode=0o700)
+        run(['tar', '--acls', '--xattrs', '--numeric-owner', '-xzpf', point / name, '-C', target])
+    (dest / 'appdata/immich/thumbs').mkdir(mode=0o755, parents=True, exist_ok=True)
+    (dest / 'appdata/immich/model-cache').mkdir(mode=0o755, parents=True, exist_ok=True)
+    # Regenerar miniaturas es explicito: conservar marcador de almacenamiento de origen.
+    for reference, expected_id in manifest['images'].items():
+        probe = subprocess.run(['docker', 'image', 'inspect', reference],
+                               capture_output=True, text=True)
+        if probe.returncode:
+            run(['docker', 'pull', reference])
+        image = json.loads(output(['docker', 'image', 'inspect', reference]))[0]
+        # Algunos motores exponen el digest del manifiesto como Id; otros,
+        # el digest de la configuracion. La referencia inmutable debe coincidir.
+        need(reference in image.get('RepoDigests', []),
+             'Digest de imagen diferente; no iniciar.')
+        need(image.get('Os') == 'linux' and image.get('Architecture') == 'amd64',
+             'Plataforma de imagen no admitida; no iniciar.')
+        need(expected_id in (image['Id'], reference.split('@', 1)[1]),
+             'Identidad de imagen diferente del punto; no iniciar.')
+    if portable:
+        # Docker Desktop debe ver los mismos archivos ext4 que Ubuntu WSL.
+        probe_image = json.loads((point / 'nextcloud.compose.json').read_text())['services']['redis']['image']
+        token = os.urandom(16).hex()
+        (dest / '.mount-probe').write_text(token)
+        for source, name, expected in [(point, 'COMPLETE', FORMAT), (dest, '.mount-probe', token)]:
+            actual = output(['docker', 'run', '--rm', '--network', 'none', '--user', '0:0', '--entrypoint', '/bin/cat',
+                             '--mount', f'type=bind,source={source},target=/probe,readonly',
+                             probe_image, f'/probe/{name}'])
+            need(actual == expected, 'El motor no ve los mismos montajes WSL; no iniciar.')
+    for app in APPS:
+        cfg = json.loads((point / f'{app}.compose.json').read_text())
+        cfg['name'] = f'cloud-restore-{app}'
+        for spec in cfg['services'].values():
+            spec['restart'] = 'no'
+            for volume in spec.get('volumes', []):
+                if volume['type'] == 'bind':
+                    source = volume['source']
+                    if source.startswith('/srv/appdata/'):
+                        volume['source'] = str(dest / 'appdata' / source.removeprefix('/srv/appdata/'))
+                    else:
+                        need(source.startswith('/srv/storage/'), 'Montaje no admitido.')
+                        need(Path(source).is_dir(), 'Falta ruta externa; no crear originales vacios.')
+        for network in cfg.get('networks', {}).values():
+            need(not network.get('external'), 'Red externa no soportada.')
+            network.pop('name', None)
+        if portable:
+            for spec in cfg['services'].values():
+                if app == 'nextcloud' and 'NEXTCLOUD_DATA_DIR' in spec.get('environment', {}):
+                    spec['environment'].update(OVERWRITECLIURL='http://localhost:18080',
+                                               OVERWRITEPROTOCOL='http', TRUSTED_PROXIES='127.0.0.1')
+                if 'ports' in spec:
+                    spec['ports'] = [dict(target=80 if app == 'nextcloud' else 2283,
+                                          published='18080' if app == 'nextcloud' else '12283',
+                                          host_ip='127.0.0.1', protocol='tcp')]
+        path = dest / f'{app}.compose.json'
+        path.write_text(json.dumps(cfg, indent=2) + '\n')
+        run(['docker', 'compose', '--project-name', f'cloud-restore-{app}',
+             '--file', path, 'config', '--quiet'])
+        run(['docker', 'compose', '--project-name', f'cloud-restore-{app}',
+             '--file', path, 'create'])
+        gateway = output(['docker', 'network', 'inspect', f'cloud-restore-{app}_default',
+                          '--format', '{{range .IPAM.Config}}{{println .Gateway}}{{end}}'])
+        need(bool(gateway) and '\n' not in gateway, 'Gateway de ensayo inesperado.')
+        for service, spec in cfg['services'].items():
+            if app == 'nextcloud' and service in ('app', 'cron'):
+                spec['environment']['TRUSTED_PROXIES'] = f'127.0.0.1 {gateway}'
+            if app == 'immich' and service == 'immich-server':
+                spec['environment']['IMMICH_TRUSTED_PROXIES'] = f'127.0.0.1,{gateway}'
+        path.write_text(json.dumps(cfg, indent=2) + '\n')
+        run(['docker', 'compose', '--project-name', f'cloud-restore-{app}',
+             '--file', path, 'config', '--quiet'])
+    # No iniciar ni habilitar al arranque. Las URLs/puertos se conservan con el origen parado.
+    unit = f'''[Unit]
+Description=Ensayo de recuperacion %i
+Requires=docker.service
+After=docker.service srv-storage.mount
+BindsTo=srv-storage.mount
+RequiresMountsFor=/srv/storage
+[Service]
+Type=simple
+WorkingDirectory={dest}
+ExecStartPre=/usr/bin/test -e {MARKER}
+ExecStartPre=/usr/bin/test ! -e /etc/homelab/recovery-freeze-restored
+ExecStartPre=/usr/bin/test -e {point}/COMPLETE
+ExecStart=/usr/bin/docker compose --project-name cloud-restore-%i --file {dest}/%i.compose.json up --abort-on-container-failure --no-color --timeout 90
+ExecStop=/usr/bin/docker compose --project-name cloud-restore-%i --file {dest}/%i.compose.json stop --timeout 90
+ExecStopPost=-/usr/bin/docker compose --project-name cloud-restore-%i --file {dest}/%i.compose.json stop --timeout 90
+TimeoutStopSec=120
+'''
+    if not portable:
+        Path('/etc/systemd/system/cloud-restore@.service').write_text(unit)
+        run(['systemctl', 'daemon-reload'])
+    else:
+        (dest / 'PORTABLE').write_text('WSL/local HTTP; no systemd units installed\n')
+    (dest / 'SOURCE_POINT').write_text(str(point) + '\n')
+    print(f'RESTAURACION PREPARADA EN SSD NUEVO: {dest}')
+    print('NO iniciada. Proxies ajustados a las redes nuevas; revisar antes de iniciar cloud-restore@...')
+    print('No reanudar el origen: la prueba reutilizara originales y puede modificarlos.')
+    if portable:
+        print('URLs de ensayo local: http://localhost:18080 y http://localhost:12283')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest='action', required=True)
+    backup_parser = sub.add_parser('backup')
+    backup_parser.add_argument('--prefix', choices=['cloud', 'mb'], default='cloud')
+    sub.add_parser('backup-restored').add_argument('restored', type=Path)
+    sub.add_parser('resume-source')
+    sub.add_parser('backup-and-resume')
+    for name in ('verify', 'prepare-restore', 'prepare-next'):
+        command = sub.add_parser(name)
+        command.add_argument('point', type=Path)
+        if name == 'prepare-restore':
+            command.add_argument('--portable', action='store_true')
+            command.add_argument('--new-host', action='store_true')
+    args = parser.parse_args()
+    need(os.geteuid() == 0, 'Ejecutar con sudo en Ubuntu.')
+    os.umask(0o077)
+    with open('/run/cloud-recovery.lock', 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Mantiene el montaje ocupado durante la operacion; nunca extraer USB en uso.
+        os.chdir(STORAGE)
+        if args.action == 'backup':
+            backup(args.prefix)
+        elif args.action == 'backup-restored':
+            backup('cloud-restore', args.restored)
+        elif args.action == 'verify':
+            verify(args.point)
+        elif args.action == 'resume-source':
+            resume_source()
+        elif args.action == 'backup-and-resume':
+            backup('cloud')
+            resume_source()
+        elif args.action == 'prepare-next':
+            prepare_next(args.point)
+        else:
+            prepare(args.point, args.portable, args.new_host)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as exc:
+        print(f'ERROR: {exc}\nSi existe mantenimiento, dejar nube parada y revisar; no retirar USB.',
+              file=sys.stderr)
+        sys.exit(1)

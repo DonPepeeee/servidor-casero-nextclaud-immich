@@ -1,0 +1,9 @@
+[Unit]
+Description=Monitor de bateria interna de la nube
+ConditionPathExists=/etc/homelab/battery.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cloud-battery check
+TimeoutStartSec=30
+UMask=0077

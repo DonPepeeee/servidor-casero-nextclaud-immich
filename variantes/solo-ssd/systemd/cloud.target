@@ -1,0 +1,6 @@
+[Unit]
+Description=Nube casera - servicios alojados en SSD
+RequiresMountsFor=/srv/storage
+
+[Install]
+WantedBy=multi-user.target
