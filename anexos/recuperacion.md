@@ -31,6 +31,8 @@ sudo /usr/local/sbin/cloud-recovery resume-source
 
 El comando rechaza una restauración iniciada, puntos incompletos y otro disco. No borres el marcador manualmente para saltarlo.
 
+El anexo de [copias y actualizaciones](copias-y-actualizaciones.md) explica `cloud-update`, sus comprobaciones y su retención, que puede borrar puntos antiguos. Consulta allí qué se ha probado y conserva una copia independiente.
+
 ## 2. Verificar el punto
 
 Introduce la ruta completa que imprimió backup. Esta variable se usa en los siguientes bloques de esta misma sesión SSH; si vuelves a conectar, repite solo la selección, no la copia:
@@ -212,7 +214,7 @@ Crea una copia antes de actualizar aplicaciones o bases y conserva ese punto. De
 
 El apagado del tutorial no ejecuta recovery. Hacer una copia antes de apagar ayuda en un traslado previsto, pero no protege los cambios acumulados si el equipo funciona durante semanas o falla antes del siguiente apagado. Estos comandos no instalan copias periódicas ni un gancho de apagado.
 
-No hay retención ni borrado automático de puntos. Revisa df y du antes de copiar y conserva varios puntos completos. backup-and-resume sirve para una copia puntual de la instalación normal; no lo programes sobre cloud-restore ni sobre la variante solo SSD. Los puntos completos guardan solo estado SSD, pero aún requieren espacio y E/S.
+`cloud-recovery backup` y `backup-and-resume` no eliminan puntos automáticamente. El uso de `cloud-update` puede aplicar la retención descrita en su anexo. Revisa df y du antes de copiar y conserva varios puntos completos. backup-and-resume sirve para una copia puntual de la instalación normal; no lo programes sobre cloud-restore ni sobre la variante solo SSD. Los puntos completos guardan solo estado SSD, pero aún requieren espacio y E/S.
 
 Una base guardada ayer y unos originales que han seguido cambiando no garantizan el estado idéntico de hoy. Para volver a fechas anteriores con garantía necesitas también originales versionados/snapshots coherentes. Este formato no contiene esos snapshots. Nextcloud puede escanear archivos, pero eso no reconstruye todas sus comparticiones; Immich no reconstruye su base escaneando su biblioteca interna.
 

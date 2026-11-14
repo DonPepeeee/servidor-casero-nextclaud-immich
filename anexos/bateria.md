@@ -102,6 +102,6 @@ Para desactivar el monitor sin iniciar otro apagado:
 sudo systemctl disable --now cloud-battery.timer
 ```
 
-Este job no sustituye las copias periódicas: el SSD puede fallar con corriente presente. No hay retención/borrado automático. La recuperación contiene secretos y no incluye configuración Wi-Fi, identidad Tailscale, SMTP o todo el sistema operativo: estos se reconstruyen aparte. Conserva otra copia independiente de los originales.
+Este job no sustituye las copias periódicas: el SSD puede fallar con corriente presente. Este flujo de batería no aplica retención ni borra puntos automáticamente; `cloud-update` tiene una retención independiente explicada en [copias y actualizaciones](copias-y-actualizaciones.md). La recuperación contiene secretos y no incluye configuración Wi-Fi, identidad Tailscale, SMTP o todo el sistema operativo: estos se reconstruyen aparte. Conserva otra copia independiente de los originales.
 
 Referencias: [alimentación sysfs del kernel](https://www.kernel.org/doc/Documentation/ABI/testing/sysfs-class-power), [servicios y límites systemd](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html). [Volver al índice](README.md).

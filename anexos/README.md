@@ -5,6 +5,7 @@ Completa primero el [tutorial principal](../README.md). Cada anexo indica cuánd
 | Anexo | Resultado |
 | --- | --- |
 | [Recuperación en Ubuntu](recuperacion.md) | Copia fría sin duplicar originales, restauración y comprobaciones |
+| [Copias y actualizaciones](copias-y-actualizaciones.md) | Copias frías, retención de puntos y actualización supervisada; consulta el alcance de las pruebas |
 | [Recuperación en Windows/WSL2](windows-wsl2.md) | Acceder al externo ext4 y ejecutar las aplicaciones recuperadas |
 | [Puertos USB](puertos-usb.md) | Comparar puertos/cables con escritura, lectura y verificación |
 | [Avisos de ocupación](avisos-ocupacion.md) | Correos al 75/85/90 %, recuperación de nivel y recordatorios |

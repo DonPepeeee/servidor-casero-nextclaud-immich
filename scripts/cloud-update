@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""Crea puntos frios o actualiza parches de la nube con copia previa."""
+import argparse
+import fcntl
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+ROOT = Path('/opt/homelab')
+RECOVERY = Path('/srv/storage/recovery')
+POINTS = RECOVERY / 'state-points'
+TOOL = '/usr/local/sbin/cloud-recovery'
+POINT_NAME = re.compile(r'^\d{8}T\d{6}Z\.[a-z0-9_]+$')
+
+
+def run(*args, capture=False):
+    result = subprocess.run([str(arg) for arg in args], check=True, text=True,
+                            capture_output=capture)
+    return result.stdout.strip() if capture else None
+
+
+def require(condition, message):
+    if not condition:
+        raise RuntimeError(message)
+
+
+def compose(app, *args, capture=False):
+    return run('docker', 'compose', '--project-name', f'cloud-{app}',
+               '--project-directory', ROOT / app, '--file', ROOT / app / 'compose.yaml',
+               *args, capture=capture)
+
+
+def plan_change(app, text, version):
+    match = re.fullmatch(r'v?(\d+)\.(\d+)\.(\d+)', version)
+    require(match, 'La version debe ser exacta: por ejemplo 3.3.6.')
+    desired = tuple(map(int, match.groups()))
+    image = (r'ghcr\.io/immich-app/immich-(?:server|machine-learning):v'
+             if app == 'immich' else r'nextcloud:')
+    suffix = '' if app == 'immich' else '-apache'
+    pattern = re.compile(r'(?m)^([ \t]*image:[ \t]*(?:&[\w-]+[ \t]+)?' + image
+                         + r')(\d+\.\d+\.\d+)(' + suffix + r')[ \t]*$')
+    matches = list(pattern.finditer(text))
+    require(len(matches) == (2 if app == 'immich' else 1), 'Imagenes inesperadas en Compose.')
+    if app == 'immich':
+        require(len({item.group(1).split(':')[-2] for item in matches}) == 2,
+                'Falta la imagen de servidor o de aprendizaje automatico.')
+    current = {tuple(map(int, item.group(2).split('.'))) for item in matches}
+    require(len(current) == 1, 'Las imagenes tienen versiones diferentes.')
+    previous = current.pop()
+    require(desired[:2] == previous[:2] and desired > previous,
+            'Solo se admiten parches ascendentes de la misma rama.')
+    changed = pattern.sub(lambda item: item.group(1) + '.'.join(map(str, desired))
+                          + item.group(3), text)
+    return previous, changed
+
+
+def points():
+    require(POINTS.is_dir() and not POINTS.is_symlink(), 'Directorio de puntos ausente o inseguro.')
+    return sorted(path for path in POINTS.iterdir() if path.is_dir() and not path.is_symlink()
+                  and POINT_NAME.fullmatch(path.name) and (path / 'COMPLETE').is_file())
+
+
+def report(title):
+    print('\n' + title, flush=True)
+    run('du', '-sh', RECOVERY)
+    run('df', '-h', '/srv/storage')
+    print(f'Puntos completos reconocidos: {len(points())}', flush=True)
+
+
+def healthy(app):
+    services = compose(app, 'config', '--services', capture=True).splitlines()
+    require(services, 'No hay servicios definidos.')
+    deadline = time.monotonic() + 900
+    last_error = None
+    while time.monotonic() < deadline:
+        ready = True
+        for service in services:
+            identifiers = compose(app, 'ps', '--all', '-q', service, capture=True).splitlines()
+            if len(identifiers) != 1:
+                ready = False
+                continue
+            try:
+                state = run('docker', 'inspect', '--format',
+                            '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}',
+                            identifiers[0], capture=True)
+            except subprocess.CalledProcessError as error:
+                last_error = error.stderr or str(error)
+                ready = False
+                continue
+            if state not in ('running healthy', 'running no-healthcheck'):
+                ready = False
+        active = subprocess.run(['systemctl', 'is-active', '--quiet', f'cloud@{app}.service']).returncode == 0
+        if ready and active:
+            print(f'{app}: servicios activos y saludables.', flush=True)
+            return
+        time.sleep(5)
+    detail = f' Ultimo error de inspeccion: {last_error.strip()}' if last_error else ''
+    raise RuntimeError(f'{app} no alcanzo el estado esperado; consulta systemctl y journalctl.{detail}')
+
+
+def write_atomic(path, text):
+    info = path.stat()
+    descriptor, temporary = tempfile.mkstemp(prefix='.cloud-update-', dir=path.parent)
+    try:
+        with os.fdopen(descriptor, 'w', encoding='utf-8', newline='') as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, info.st_mode & 0o7777)
+        os.chown(temporary, info.st_uid, info.st_gid)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def check_images(app, version):
+    tag = version.removeprefix('v')
+    expected = ({'immich-server': f'ghcr.io/immich-app/immich-server:v{tag}',
+                 'immich-machine-learning': f'ghcr.io/immich-app/immich-machine-learning:v{tag}'}
+                if app == 'immich' else
+                {'app': f'nextcloud:{tag}-apache', 'cron': f'nextcloud:{tag}-apache'})
+    for service, image in expected.items():
+        identifiers = compose(app, 'ps', '--all', '-q', service, capture=True).splitlines()
+        require(len(identifiers) == 1, f'No se puede identificar el contenedor {service}.')
+        actual = run('docker', 'inspect', '--format', '{{.Config.Image}}', identifiers[0], capture=True)
+        require(actual == image, f'{service} usa {actual}, no la imagen esperada {image}.')
+
+
+def prune(new_point):
+    existing = points()
+    require(new_point in existing, 'No se encuentra el punto nuevo.')
+    for point in existing:
+        run(TOOL, 'verify', point)
+    with open('/run/cloud-recovery.lock', 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        run('/usr/local/sbin/cloud-storage-check')
+        require(points() == existing, 'El inventario de puntos ha cambiado; no borrar.')
+        for marker in ('recovery-maintenance', 'recovery-restore-started',
+                       'recovery-freeze-restored', 'recovery-next-started'):
+            require(not (Path('/etc/homelab') / marker).exists(), 'Recuperacion activa; no borrar.')
+        require(not any(Path('/srv').glob('cloud-restore.*')), 'Hay una restauracion preparada; no borrar.')
+        require(not any(path.name.endswith('.partial') for path in POINTS.iterdir()),
+                'Hay puntos parciales; no borrar automaticamente.')
+        for point in existing[:-4]:
+            require(point != new_point and not point.is_symlink(), 'Punto inesperado; no borrar.')
+            print(f'Eliminando punto antiguo: {point}', flush=True)
+            shutil.rmtree(point)
+
+
+def backup_point():
+    for candidate in ('nextcloud', 'immich'):
+        healthy(candidate)
+    report('ANTES DE LA COPIA')
+    before = set(points())
+    run(TOOL, 'backup-and-resume')
+    created = set(points()) - before
+    require(len(created) == 1, 'No se puede identificar un unico punto nuevo.')
+    point = created.pop()
+    run(TOOL, 'verify', point)
+    report('DESPUES DE LA COPIA')
+    for candidate in ('nextcloud', 'immich'):
+        healthy(candidate)
+    return point
+
+
+def retain(point):
+    try:
+        prune(point)
+    except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+        print(f'AVISO: retencion omitida o incompleta: {error}', file=sys.stderr)
+    report('ESTADO FINAL')
+
+
+def update(app, version):
+    path = ROOT / app / 'compose.yaml'
+    require(path.is_file() and not path.is_symlink(), 'Compose ausente o enlace no permitido.')
+    original = path.read_text(encoding='utf-8')
+    old, changed = plan_change(app, original, version)
+    point = backup_point()
+    require(path.read_text(encoding='utf-8') == original, 'Compose modificado durante la copia.')
+    print(f'Actualizando {app} {".".join(map(str, old))} -> {version}', flush=True)
+    write_atomic(path, changed)
+    try:
+        compose(app, 'config', '--quiet')
+        services = ('immich-server', 'immich-machine-learning') if app == 'immich' else ('app', 'cron')
+        compose(app, 'pull', *services)
+    except Exception:
+        write_atomic(path, original)
+        print('Compose original restaurado; no se ha reiniciado.', file=sys.stderr)
+        raise
+    run('systemctl', 'restart', f'cloud@{app}.service')
+    healthy(app)
+    check_images(app, version)
+    print(f'Actualizacion completada. Punto previo: {point}', flush=True)
+    retain(point)
+    print('Comprueba acceso, archivos y subidas. Recovery no contiene los originales.')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('servicio', choices=('backup', 'immich', 'nextcloud'))
+    parser.add_argument('version', nargs='?')
+    args = parser.parse_args()
+    if (args.servicio == 'backup') != (args.version is None):
+        parser.error('Usa backup sin version, o immich/nextcloud con version.')
+    require(os.geteuid() == 0, 'Ejecuta con sudo.')
+    with open('/run/cloud-update.lock', 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        run('/usr/local/sbin/cloud-storage-check')
+        if args.servicio == 'backup':
+            point = backup_point()
+            print(f'Copia completada: {point}', flush=True)
+            retain(point)
+            print('Comprueba acceso desde los clientes. Recovery no contiene los originales.')
+        else:
+            update(args.servicio, args.version)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+        print(f'ERROR: {error}', file=sys.stderr)
+        print('No borres marcadores ni reinicies sin revisar el estado.', file=sys.stderr)
+        sys.exit(1)
